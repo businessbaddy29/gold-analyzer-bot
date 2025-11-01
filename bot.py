@@ -5,18 +5,30 @@ import datetime
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
+
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
 load_dotenv()
 
+# --- Environment / config ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "Worlds_Support")  # without @
+# This should be the public URL Render provides, e.g. https://gold-analyzer-bot.onrender.com
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "users.db")
+IMAGES_DIR = os.path.join(os.path.dirname(__file__), "images")
+os.makedirs(IMAGES_DIR, exist_ok=True)
 
-# ---------- Health server for Render (keeps web service happy) ----------
+# ---------- Health server for Render ----------
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -29,11 +41,12 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", port), _HealthHandler)
     server.serve_forever()
 
-# ---------- DB helpers ----------
+# ---------- Database helpers ----------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS users (
             chat_id INTEGER PRIMARY KEY,
             username TEXT,
@@ -42,7 +55,8 @@ def init_db():
             expires_at TEXT,
             last_image TEXT
         )
-    """)
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -51,13 +65,15 @@ def upsert_user(chat_id, username):
     cur = conn.cursor()
     cur.execute("INSERT OR IGNORE INTO users(chat_id, username) VALUES (?, ?)", (chat_id, username))
     cur.execute("UPDATE users SET username=? WHERE chat_id=?", (username, chat_id))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 def set_last_image(chat_id, image_path):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("UPDATE users SET last_image=? WHERE chat_id=?", (image_path, chat_id))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 def activate_user(chat_id, days=30):
     conn = sqlite3.connect(DB_FILE)
@@ -65,15 +81,20 @@ def activate_user(chat_id, days=30):
     now = datetime.datetime.utcnow()
     expires = now + datetime.timedelta(days=int(days))
     cur.execute("INSERT OR IGNORE INTO users(chat_id, username) VALUES (?, ?)", (chat_id, "unknown"))
-    cur.execute("UPDATE users SET is_active=1, activated_at=?, expires_at=? WHERE chat_id=?", (now.isoformat(), expires.isoformat(), chat_id))
-    conn.commit(); conn.close()
+    cur.execute(
+        "UPDATE users SET is_active=1, activated_at=?, expires_at=? WHERE chat_id=?",
+        (now.isoformat(), expires.isoformat(), chat_id),
+    )
+    conn.commit()
+    conn.close()
     return expires
 
 def deactivate_user(chat_id):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("UPDATE users SET is_active=0, activated_at=NULL, expires_at=NULL WHERE chat_id=?", (chat_id,))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 def get_active_users():
     conn = sqlite3.connect(DB_FILE)
@@ -100,15 +121,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"👋 Welcome {username}!\n\nUpload your chart screenshot and then send /analyze (if active)."
     await update.message.reply_text(msg)
 
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"Your chat id: {chat_id}")
+
 async def echo_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
-    os.makedirs("images", exist_ok=True)
-    file_path = f"images/{chat_id}_{int(datetime.datetime.utcnow().timestamp())}.jpg"
-    await file.download_to_drive(file_path)
-    set_last_image(chat_id, file_path)
-    await update.message.reply_text("📸 Screenshot saved! Use /analyze to run analysis (if active).")
+    # Save highest resolution photo
+    try:
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+        filename = f"{chat_id}_{int(datetime.datetime.utcnow().timestamp())}.jpg"
+        path = os.path.join(IMAGES_DIR, filename)
+        await file.download_to_drive(path)
+        set_last_image(chat_id, path)
+        await update.message.reply_text("📸 Screenshot saved! Use /analyze to run analysis (if active).")
+    except Exception as e:
+        await update.message.reply_text("❌ Could not save image. Try again.")
+        print("Error saving image:", e)
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -119,14 +149,13 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_active = row[2]
     last_image = row[5]
     if not is_active:
-        # clickable admin mention: @username
-        admin_link = f"@{ADMIN_USERNAME}"
+        admin_link = f"@{ADMIN_USERNAME}" if ADMIN_USERNAME else "admin"
         msg = (
             f"Your access is inactive. Contact admin {admin_link} to activate.\n\n"
             "Steps:\n"
-            "1) Message the admin and send your chat id (send `/myid` to get it).\n"
-            "2) Admin will activate your account after payment.\n\n"
-            "To get your chat id, send /myid"
+            "1) Send /myid to the bot and copy your chat id.\n"
+            "2) Message the admin and share your chat id + payment details.\n"
+            "3) Admin will activate you using /activate <chat_id> <days>.\n"
         )
         await update.message.reply_text(msg)
         return
@@ -134,15 +163,10 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No screenshot found. Upload one first.")
         return
 
-    # Placeholder analysis — replace with real OpenAI Vision integration later
-    await update.message.reply_text(f"📊 Analysis placeholder for image: {last_image}\n(Integration with OpenAI Vision coming next).")
+    # Placeholder: real OpenAI Vision integration to be added in next step
+    await update.message.reply_text(f"📊 Analysis placeholder for image: {last_image}\n(We will add OpenAI Vision next.)")
 
-# small helper for user to get their chat id
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await update.message.reply_text(f"Your chat id: {chat_id}")
-
-# ---------- Admin commands ----------
+# ---------- Admin helpers & commands ----------
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
@@ -155,16 +179,18 @@ async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) < 1:
         await update.message.reply_text("Usage: /activate <chat_id> [days]. Example: /activate 123456789 30")
         return
-    target = int(args[0])
-    days = int(args[1]) if len(args) >= 2 else 30
-    expires = activate_user(target, days)
-    # Notify admin
-    await update.message.reply_text(f"Activated {target} until {expires.isoformat()}")
-    # Notify user
     try:
-        await context.bot.send_message(chat_id=target, text=f"✅ Your account has been activated by admin until {expires.date().isoformat()}. You can now use /analyze.")
-    except Exception as e:
-        await update.message.reply_text(f"Note: could not send message to user {target}. They might not have started the bot. ({e})")
+        target = int(args[0])
+        days = int(args[1]) if len(args) >= 2 else 30
+        expires = activate_user(target, days)
+        await update.message.reply_text(f"Activated {target} until {expires.date().isoformat()}")
+        # Notify user
+        try:
+            await context.bot.send_message(chat_id=target, text=f"✅ Your account has been activated until {expires.date().isoformat()}. You can now use /analyze.")
+        except Exception as e:
+            await update.message.reply_text(f"Note: could not send message to user {target}. They might not have started the bot. ({e})")
+    except Exception as ex:
+        await update.message.reply_text(f"Error: {ex}")
 
 async def cmd_deactivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caller = update.effective_user.id
@@ -175,13 +201,16 @@ async def cmd_deactivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) < 1:
         await update.message.reply_text("Usage: /deactivate <chat_id>")
         return
-    target = int(args[0])
-    deactivate_user(target)
-    await update.message.reply_text(f"Deactivated {target}")
     try:
-        await context.bot.send_message(chat_id=target, text="⚠️ Your account has been deactivated by admin.")
-    except:
-        pass
+        target = int(args[0])
+        deactivate_user(target)
+        await update.message.reply_text(f"Deactivated {target}")
+        try:
+            await context.bot.send_message(chat_id=target, text="⚠️ Your account has been deactivated by admin.")
+        except:
+            pass
+    except Exception as ex:
+        await update.message.reply_text(f"Error: {ex}")
 
 async def cmd_list_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caller = update.effective_user.id
@@ -198,40 +227,52 @@ async def cmd_list_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"- {username or 'unknown'} ({chat_id}) — expires {expires}")
     await update.message.reply_text("\n".join(lines))
 
-# alias
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_list_active(update, context)
 
-# ---------- main ----------
+# ---------- Main & startup (webhook mode) ----------
 def main():
     init_db()
-    # start health server in background
+
+    # start health server for Render to detect an open port
     Thread(target=run_health_server, daemon=True).start()
 
     if not BOT_TOKEN:
         print("ERROR: BOT_TOKEN not set in environment")
         return
 
+    # Build the Telegram application and assign it to variable 'app'
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    # user commands
+
+    # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(MessageHandler(filters.PHOTO, echo_image))
     app.add_handler(CommandHandler("analyze", analyze))
-    # admin
     app.add_handler(CommandHandler("activate", cmd_activate))
     app.add_handler(CommandHandler("deactivate", cmd_deactivate))
     app.add_handler(CommandHandler("list_active", cmd_list_active))
     app.add_handler(CommandHandler("stats", cmd_stats))
 
-    print("🤖 Bot started successfully — webhook active!")
-webhook_url = f"https://gold-analyzer-bot.onrender.com/{BOT_TOKEN}"
-app.run_webhook(
-    listen="0.0.0.0",
-    port=int(os.getenv("PORT", 8000)),
-    url_path=BOT_TOKEN,
-    webhook_url=webhook_url
-)
+    # Resolve service_url (RENDER_EXTERNAL_URL should be set in Render environment)
+    service_url = RENDER_EXTERNAL_URL or os.getenv("SERVICE_URL") or ""
+    if not service_url:
+        print("WARNING: RENDER_EXTERNAL_URL not set. Set it to your Render app URL (https://your-app.onrender.com)")
+        # continue: we'll still try to run webhook, but webhook_url will be incomplete
+
+    webhook_url = f"{service_url.rstrip('/')}/{BOT_TOKEN}" if service_url else f"/{BOT_TOKEN}"
+    print("🤖 Bot starting in WEBHOOK mode. Webhook URL:", webhook_url)
+
+    # Start webhook (listen on PORT; Render provides PORT env var)
+    try:
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.getenv("PORT", "8000")),
+            url_path=BOT_TOKEN,
+            webhook_url=webhook_url,
+        )
+    except Exception as e:
+        print("Webhook start failed:", e)
 
 if __name__ == "__main__":
     main()
