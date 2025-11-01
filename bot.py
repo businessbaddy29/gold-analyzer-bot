@@ -2,6 +2,7 @@
 import os
 import sqlite3
 import datetime
+import asyncio
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -16,6 +17,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "Worlds_Support")  # without @
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # optional for later
 
 BASE_DIR = os.path.dirname(__file__)
 DB_FILE = os.path.join(BASE_DIR, "users.db")
@@ -119,6 +121,41 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Your chat id: {chat_id}")
 
 
+# Background processing function
+async def process_image_background(bot, chat_id: int, image_path: str):
+    """Non-blocking background task to process the saved image and send final result."""
+    try:
+        # Let user know processing has started (separate message)
+        await bot.send_message(chat_id=chat_id, text="🔎 Processing your screenshot — I'll send results here when ready.")
+    except Exception:
+        pass
+
+    # ------------------------
+    # PLACEHOLDER: put heavy processing / OpenAI Vision call here.
+    # Example: Call OpenAI vision API here and parse the result into a table/signal.
+    # Ensure you set OPENAI_API_KEY in Render environment when you add real calls.
+    # ------------------------
+
+    # Simulate work (replace with real processing)
+    await asyncio.sleep(2)  # short simulated delay
+
+    # Example simulated result (replace with real analysis output)
+    result_text = (
+        "✅ Analysis complete (simulated).\n\n"
+        "Signal: No strong confluence found.\n"
+        "Trend: Neutral\n"
+        "Support: 2045\n"
+        "Resistance: 4120\n"
+        "Note: OpenAI integration not enabled yet."
+    )
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=result_text)
+    except Exception as e:
+        print("Error sending final result:", e)
+
+
+# Updated image handler - quick ack + background processing
 async def echo_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     try:
@@ -128,8 +165,18 @@ async def echo_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         path = os.path.join(IMAGES_DIR, filename)
         await file.download_to_drive(path)
         set_last_image(chat_id, path)
-        await update.message.reply_text("📸 Screenshot saved! Use /analyze to run analysis (if active).")
-    except Exception:
+
+        # Immediate reply so webhook returns quickly
+        await update.message.reply_text(
+            "📸 Screenshot saved! Processing will continue in background — you will receive results here shortly."
+        )
+
+        # Schedule background processing (non-blocking)
+        # Pass context.bot so background task can send messages
+        asyncio.create_task(process_image_background(context.bot, chat_id, path))
+
+    except Exception as e:
+        print("Image save error:", e)
         await update.message.reply_text("❌ Could not save image. Try again.")
 
 
@@ -156,7 +203,6 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No screenshot found. Upload one first.")
         return
 
-    # Placeholder for real analysis
     await update.message.reply_text(f"📊 Analysis placeholder for image: {last_image}\n(Integration with OpenAI Vision coming next.)")
 
 
@@ -256,7 +302,6 @@ def main():
     print("🤖 Bot starting in WEBHOOK mode. Webhook URL:", webhook_url)
 
     try:
-        # Bind webhook on Render PORT (Render sets PORT env var)
         app.run_webhook(
             listen="0.0.0.0",
             port=int(os.getenv("PORT", "8000")),
