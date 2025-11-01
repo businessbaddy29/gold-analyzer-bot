@@ -224,8 +224,14 @@ def main():
     app.add_handler(CommandHandler("list_active", cmd_list_active))
     app.add_handler(CommandHandler("stats", cmd_stats))
 
-    print("🤖 Bot started successfully — polling...")
-    app.run_polling()
+    print("🤖 Bot started successfully — webhook active!")
+webhook_url = f"https://gold-analyzer-bot.onrender.com/{BOT_TOKEN}"
+app.run_webhook(
+    listen="0.0.0.0",
+    port=int(os.getenv("PORT", 8000)),
+    url_path=BOT_TOKEN,
+    webhook_url=webhook_url
+)
 
 if __name__ == "__main__":
     main()
