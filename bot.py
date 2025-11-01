@@ -1,3 +1,25 @@
+# add at top
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import os
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def run_health_server():
+    port = int(os.getenv("PORT", "8000"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    server.serve_forever()
+
+# before app.run_polling() start the health server in background
+if __name__ == "__main__":
+    Thread(target=run_health_server, daemon=True).start()
+    main()  # your existing main() that runs the bot
+
+
 import os
 from dotenv import load_dotenv
 from telegram import Update
