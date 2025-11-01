@@ -3,3 +3,4 @@ aiohttp
 python-dotenv
 pillow
 requests
+openai   # optional (only if you will use OpenAI)
