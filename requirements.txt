@@ -1,7 +1,5 @@
 python-telegram-bot[webhooks]==20.3
 aiohttp
-openai
-requests
-apscheduler
-pillow
 python-dotenv
+pillow
+requests
