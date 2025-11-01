@@ -2,10 +2,6 @@
 import os
 import sqlite3
 import datetime
-from threading import Thread
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from dotenv import load_dotenv
-
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -15,33 +11,19 @@ from telegram.ext import (
     ContextTypes,
 )
 
-load_dotenv()
-
-# --- Environment / config ---
+# ---------------- config ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "Worlds_Support")  # without @
-# This should be the public URL Render provides, e.g. https://gold-analyzer-bot.onrender.com
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
-DB_FILE = os.path.join(os.path.dirname(__file__), "users.db")
-IMAGES_DIR = os.path.join(os.path.dirname(__file__), "images")
+BASE_DIR = os.path.dirname(__file__)
+DB_FILE = os.path.join(BASE_DIR, "users.db")
+IMAGES_DIR = os.path.join(BASE_DIR, "images")
 os.makedirs(IMAGES_DIR, exist_ok=True)
 
-# ---------- Health server for Render ----------
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK")
 
-def run_health_server():
-    port = int(os.getenv("PORT", "8000"))
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    server.serve_forever()
-
-# ---------- Database helpers ----------
+# ---------------- DB helpers ----------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -60,6 +42,7 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 def upsert_user(chat_id, username):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -68,12 +51,14 @@ def upsert_user(chat_id, username):
     conn.commit()
     conn.close()
 
+
 def set_last_image(chat_id, image_path):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("UPDATE users SET last_image=? WHERE chat_id=?", (image_path, chat_id))
     conn.commit()
     conn.close()
+
 
 def activate_user(chat_id, days=30):
     conn = sqlite3.connect(DB_FILE)
@@ -89,12 +74,14 @@ def activate_user(chat_id, days=30):
     conn.close()
     return expires
 
+
 def deactivate_user(chat_id):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("UPDATE users SET is_active=0, activated_at=NULL, expires_at=NULL WHERE chat_id=?", (chat_id,))
     conn.commit()
     conn.close()
+
 
 def get_active_users():
     conn = sqlite3.connect(DB_FILE)
@@ -104,15 +91,20 @@ def get_active_users():
     conn.close()
     return rows
 
+
 def get_user(chat_id):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("SELECT chat_id, username, is_active, activated_at, expires_at, last_image FROM users WHERE chat_id=?", (chat_id,))
+    cur.execute(
+        "SELECT chat_id, username, is_active, activated_at, expires_at, last_image FROM users WHERE chat_id=?",
+        (chat_id,),
+    )
     row = cur.fetchone()
     conn.close()
     return row
 
-# ---------- Telegram handlers ----------
+
+# ---------------- Telegram handlers ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -121,13 +113,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"👋 Welcome {username}!\n\nUpload your chart screenshot and then send /analyze (if active)."
     await update.message.reply_text(msg)
 
+
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(f"Your chat id: {chat_id}")
 
+
 async def echo_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    # Save highest resolution photo
     try:
         photo = update.message.photo[-1]
         file = await photo.get_file()
@@ -136,9 +129,9 @@ async def echo_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_drive(path)
         set_last_image(chat_id, path)
         await update.message.reply_text("📸 Screenshot saved! Use /analyze to run analysis (if active).")
-    except Exception as e:
+    except Exception:
         await update.message.reply_text("❌ Could not save image. Try again.")
-        print("Error saving image:", e)
+
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -163,12 +156,14 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No screenshot found. Upload one first.")
         return
 
-    # Placeholder: real OpenAI Vision integration to be added in next step
-    await update.message.reply_text(f"📊 Analysis placeholder for image: {last_image}\n(We will add OpenAI Vision next.)")
+    # Placeholder for real analysis
+    await update.message.reply_text(f"📊 Analysis placeholder for image: {last_image}\n(Integration with OpenAI Vision coming next.)")
 
-# ---------- Admin helpers & commands ----------
+
+# ---------------- Admin commands ----------------
 def is_admin(user_id):
     return user_id in ADMIN_IDS
+
 
 async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caller = update.effective_user.id
@@ -184,13 +179,13 @@ async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         days = int(args[1]) if len(args) >= 2 else 30
         expires = activate_user(target, days)
         await update.message.reply_text(f"Activated {target} until {expires.date().isoformat()}")
-        # Notify user
         try:
             await context.bot.send_message(chat_id=target, text=f"✅ Your account has been activated until {expires.date().isoformat()}. You can now use /analyze.")
         except Exception as e:
             await update.message.reply_text(f"Note: could not send message to user {target}. They might not have started the bot. ({e})")
     except Exception as ex:
         await update.message.reply_text(f"Error: {ex}")
+
 
 async def cmd_deactivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caller = update.effective_user.id
@@ -212,6 +207,7 @@ async def cmd_deactivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as ex:
         await update.message.reply_text(f"Error: {ex}")
 
+
 async def cmd_list_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caller = update.effective_user.id
     if not is_admin(caller):
@@ -227,24 +223,22 @@ async def cmd_list_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"- {username or 'unknown'} ({chat_id}) — expires {expires}")
     await update.message.reply_text("\n".join(lines))
 
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_list_active(update, context)
 
-# ---------- Main & startup (webhook mode) ----------
+
+# ---------------- Main startup (webhook mode only) ----------------
 def main():
     init_db()
-
-    # start health server for Render to detect an open port
-    Thread(target=run_health_server, daemon=True).start()
 
     if not BOT_TOKEN:
         print("ERROR: BOT_TOKEN not set in environment")
         return
 
-    # Build the Telegram application and assign it to variable 'app'
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Register handlers
+    # register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(MessageHandler(filters.PHOTO, echo_image))
@@ -254,17 +248,15 @@ def main():
     app.add_handler(CommandHandler("list_active", cmd_list_active))
     app.add_handler(CommandHandler("stats", cmd_stats))
 
-    # Resolve service_url (RENDER_EXTERNAL_URL should be set in Render environment)
+    # webhook URL: must be your render external URL + /<BOT_TOKEN>
     service_url = RENDER_EXTERNAL_URL or os.getenv("SERVICE_URL") or ""
     if not service_url:
         print("WARNING: RENDER_EXTERNAL_URL not set. Set it to your Render app URL (https://your-app.onrender.com)")
-        # continue: we'll still try to run webhook, but webhook_url will be incomplete
-
     webhook_url = f"{service_url.rstrip('/')}/{BOT_TOKEN}" if service_url else f"/{BOT_TOKEN}"
     print("🤖 Bot starting in WEBHOOK mode. Webhook URL:", webhook_url)
 
-    # Start webhook (listen on PORT; Render provides PORT env var)
     try:
+        # Bind webhook on Render PORT (Render sets PORT env var)
         app.run_webhook(
             listen="0.0.0.0",
             port=int(os.getenv("PORT", "8000")),
@@ -273,6 +265,7 @@ def main():
         )
     except Exception as e:
         print("Webhook start failed:", e)
+
 
 if __name__ == "__main__":
     main()
