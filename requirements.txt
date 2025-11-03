@@ -1,6 +1,23 @@
-python-telegram-bot[webhooks]==20.3
-aiohttp
-python-dotenv
-pillow
+# === Gold Analyzer Bot Requirements ===
+# Flask server for webhook handling
+flask
+
+# HTTP requests (Telegram + Azure)
 requests
-openai   # optional (only if you will use OpenAI)
+
+# Environment variable management
+python-dotenv
+
+# Azure OpenAI SDK (for Azure API integration)
+azure-ai-openai
+azure-core
+azure-identity
+
+# Image handling (optional, for screenshots)
+pillow
+
+# Telegram bot library (optional, not used directly but safe to include)
+python-telegram-bot[webhooks]==20.3
+
+# aiohttp for async handling (Render internal dependency)
+aiohttp
