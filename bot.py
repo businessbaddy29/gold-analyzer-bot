@@ -1,316 +1,272 @@
-# bot.py
+#!/usr/bin/env python3
+"""
+Bot for Telegram + Azure OpenAI (vision) integration.
+
+Requirements (pip):
+  pip install flask requests python-dotenv
+
+Env vars (set on Render / locally):
+  TELEGRAM_TOKEN            -> Telegram bot token (botXXXXXXXX:YYYY)
+  BASE_URL                  -> Public URL of your service, e.g. https://gold-analyzer-bot.onrender.com
+  AZURE_OPENAI_ENDPOINT     -> e.g. https://samee-mhjab3yd-eastus2.cognitiveservices.azure.com/
+  AZURE_OPENAI_DEPLOYMENT   -> e.g. gpt-4o-mini
+  AZURE_OPENAI_KEY          -> Azure OpenAI API key
+"""
+
 import os
-import sqlite3
-import datetime
-import asyncio
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+import json
+import base64
+import threading
+import time
+from io import BytesIO
 
-# ---------------- config ----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "Worlds_Support")  # without @
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # optional for later
+import requests
+from flask import Flask, request, jsonify
 
-BASE_DIR = os.path.dirname(__file__)
-DB_FILE = os.path.join(BASE_DIR, "users.db")
-IMAGES_DIR = os.path.join(BASE_DIR, "images")
-os.makedirs(IMAGES_DIR, exist_ok=True)
+# load env
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+BASE_URL = os.environ.get("BASE_URL")  # e.g. https://gold-analyzer-bot.onrender.com (no trailing slash)
+AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")  # e.g. https://...cognitiveservices.azure.com/
+AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY")
+API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
 
+if not all([TELEGRAM_TOKEN, BASE_URL, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_DEPLOYMENT]):
+    missing = [k for k in ["TELEGRAM_TOKEN","BASE_URL","AZURE_OPENAI_ENDPOINT","AZURE_OPENAI_KEY","AZURE_OPENAI_DEPLOYMENT"] if not os.environ.get(k)]
+    raise SystemExit(f"Missing required env vars: {missing}")
 
-# ---------------- DB helpers ----------------
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id INTEGER PRIMARY KEY,
-            username TEXT,
-            is_active INTEGER DEFAULT 0,
-            activated_at TEXT,
-            expires_at TEXT,
-            last_image TEXT
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
+app = Flask(__name__)
 
-def upsert_user(chat_id, username):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users(chat_id, username) VALUES (?, ?)", (chat_id, username))
-    cur.execute("UPDATE users SET username=? WHERE chat_id=?", (username, chat_id))
-    conn.commit()
-    conn.close()
+# helper to send message to Telegram
+def send_message(chat_id, text, reply_to_message_id=None):
+    url = f"{TELEGRAM_API}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = reply_to_message_id
+    r = requests.post(url, json=payload, timeout=30)
+    return r.ok, r.text
 
+def send_photo(chat_id, photo_bytes, caption=None):
+    url = f"{TELEGRAM_API}/sendPhoto"
+    files = {"photo": ("image.jpg", photo_bytes)}
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption
+    r = requests.post(url, data=data, files=files, timeout=60)
+    return r.ok, r.text
 
-def set_last_image(chat_id, image_path):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET last_image=? WHERE chat_id=?", (image_path, chat_id))
-    conn.commit()
-    conn.close()
+# download Telegram file bytes by file_path
+def download_telegram_file(file_path):
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+    r = requests.get(file_url, timeout=30)
+    r.raise_for_status()
+    return r.content
 
+# Get file path from Telegram getFile
+def get_file_path(file_id):
+    url = f"{TELEGRAM_API}/getFile"
+    r = requests.get(url, params={"file_id": file_id}, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    if not j.get("ok"):
+        raise RuntimeError("getFile failed: " + json.dumps(j))
+    return j["result"]["file_path"]
 
-def activate_user(chat_id, days=30):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    now = datetime.datetime.utcnow()
-    expires = now + datetime.timedelta(days=int(days))
-    cur.execute("INSERT OR IGNORE INTO users(chat_id, username) VALUES (?, ?)", (chat_id, "unknown"))
-    cur.execute(
-        "UPDATE users SET is_active=1, activated_at=?, expires_at=? WHERE chat_id=?",
-        (now.isoformat(), expires.isoformat(), chat_id),
-    )
-    conn.commit()
-    conn.close()
-    return expires
+# Compose Azure request (we will include base64 data url)
+def call_azure_image_analysis(image_bytes, prompt_text):
+    """
+    Send image + prompt to Azure OpenAI chat completions endpoint (deployment).
+    We pass an 'input' like structure with an input_text and an input_image (base64 data URL).
+    """
+    # Build data URL (jpeg)
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:image/jpeg;base64,{b64}"
 
+    # Azure chat completions endpoint for deployment:
+    # POST {endpoint}/openai/deployments/{deployment}/chat/completions?api-version={API_VERSION}
+    endpoint = AZURE_OPENAI_ENDPOINT.rstrip("/") + f"/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version={API_VERSION}"
 
-def deactivate_user(chat_id):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET is_active=0, activated_at=NULL, expires_at=NULL WHERE chat_id=?", (chat_id,))
-    conn.commit()
-    conn.close()
+    headers = {
+        "Content-Type": "application/json",
+        "api-key": AZURE_OPENAI_KEY
+    }
 
+    # Payload — include image as part of content array following examples used in Azure docs (image as input)
+    # NOTE: Azure flavors vary; this structure works with many image-enabled chat endpoints.
+    payload = {
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant that analyzes gold trading charts. Give clear Trend, Support & Resistance, Candlestick pattern (if any), Entry confluence, SL, TP, Timeframes H1 and H4."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt_text},
+                    {"type": "input_image", "image_url": data_url}
+                ]
+            }
+        ],
+        "max_tokens": 800,
+        "temperature": 0.1
+    }
 
-def get_active_users():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT chat_id, username, expires_at FROM users WHERE is_active=1")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    # Make request
+    resp = requests.post(endpoint, headers=headers, json=payload, timeout=120)
+    # if status not OK, raise helpful info
+    if resp.status_code != 200:
+        # return full body for debugging
+        return False, f"Azure returned status {resp.status_code}: {resp.text}"
 
+    # Parse response — different Azure versions return slightly different shapes
+    j = resp.json()
 
-def get_user(chat_id):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT chat_id, username, is_active, activated_at, expires_at, last_image FROM users WHERE chat_id=?",
-        (chat_id,),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-# ---------------- Telegram handlers ----------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-    username = user.username or f"{user.first_name or ''} {user.last_name or ''}".strip()
-    upsert_user(chat_id, username)
-    msg = f"👋 Welcome {username}!\n\nUpload your chart screenshot and then send /analyze (if active)."
-    await update.message.reply_text(msg)
-
-
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await update.message.reply_text(f"Your chat id: {chat_id}")
-
-
-# Background processing function
-async def process_image_background(bot, chat_id: int, image_path: str):
-    """Non-blocking background task to process the saved image and send final result."""
+    # Common patterns: 'choices' with 'message' or 'output_text' field; or 'reply' etc.
+    # We'll try several heuristics:
+    text = None
+    # 1) choices -> 0 -> message -> content -> parts / 0 / text
     try:
-        # Let user know processing has started (separate message)
-        await bot.send_message(chat_id=chat_id, text="🔎 Processing your screenshot — I'll send results here when ready.")
+        if "choices" in j and len(j["choices"])>0:
+            ch = j["choices"][0]
+            if isinstance(ch.get("message"), dict):
+                # message.content can be a string or list
+                msg = ch["message"].get("content")
+                if isinstance(msg, str):
+                    text = msg
+                elif isinstance(msg, list):
+                    # find first text block
+                    for part in msg:
+                        if isinstance(part, str):
+                            text = part
+                            break
+                        if isinstance(part, dict) and "text" in part:
+                            text = part["text"]
+                            break
+            elif "message" in ch and isinstance(ch["message"], str):
+                text = ch["message"]
+            elif "text" in ch:
+                text = ch["text"]
     except Exception:
         pass
 
-    # ------------------------
-    # PLACEHOLDER: put heavy processing / OpenAI Vision call here.
-    # Example: Call OpenAI vision API here and parse the result into a table/signal.
-    # Ensure you set OPENAI_API_KEY in Render environment when you add real calls.
-    # ------------------------
+    # 2) 'output_text' top-level
+    if not text:
+        if "output_text" in j:
+            text = j["output_text"]
 
-    # Simulate work (replace with real processing)
-    await asyncio.sleep(2)  # short simulated delay
+    # 3) 'response' -> 'output' etc
+    if not text:
+        # inspect nested fields quickly
+        for k in ("response","result","output"):
+            if k in j and isinstance(j[k], dict):
+                for k2 in ("output_text","text"):
+                    if k2 in j[k]:
+                        text = j[k][k2]
+                        break
+                if text:
+                    break
 
-    # Example simulated result (replace with real analysis output)
-    result_text = (
-        "✅ Analysis complete (simulated).\n\n"
-        "Signal: No strong confluence found.\n"
-        "Trend: Neutral\n"
-        "Support: 2045\n"
-        "Resistance: 4120\n"
-        "Note: OpenAI integration not enabled yet."
-    )
+    # 4) fallback: dump the whole json as a string
+    if not text:
+        text = "No standard text found in Azure response. Raw JSON:\n" + json.dumps(j, indent=2)[:1800]
 
+    return True, text
+
+# Background worker for processing image to azure and responding to user
+def process_screenshot_async(chat_id, message_id, image_bytes):
     try:
-        await bot.send_message(chat_id=chat_id, text=result_text)
-    except Exception as e:
-        print("Error sending final result:", e)
+        # Step 1: send a processing message (edit or new)
+        send_message(chat_id, "🔎 Processing your screenshot — I'll send results here when ready.", reply_to_message_id=message_id)
 
-
-# Updated image handler - quick ack + background processing
-async def echo_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    try:
-        photo = update.message.photo[-1]
-        file = await photo.get_file()
-        filename = f"{chat_id}_{int(datetime.datetime.utcnow().timestamp())}.jpg"
-        path = os.path.join(IMAGES_DIR, filename)
-        await file.download_to_drive(path)
-        set_last_image(chat_id, path)
-
-        # Immediate reply so webhook returns quickly
-        await update.message.reply_text(
-            "📸 Screenshot saved! Processing will continue in background — you will receive results here shortly."
+        # Step 2: create a concise prompt that instructs model for trading analysis
+        prompt = (
+            "Analyze the attached gold price chart screenshot (candlestick chart). "
+            "Return a short structured analysis with sections: Trend, Support, Resistance, "
+            "Candlestick pattern (if any), Entry confluence (why enter), Suggested entry price(s), "
+            "Stop Loss (SL), Take Profit (TP), Timeframes checked (H1 and H4). "
+            "Be concise and give numeric values if visible; if you can't determine values, say 'not visible'."
         )
 
-        # Schedule background processing (non-blocking)
-        # Pass context.bot so background task can send messages
-        asyncio.create_task(process_image_background(context.bot, chat_id, path))
+        ok, azure_text = call_azure_image_analysis(image_bytes, prompt)
+        if not ok:
+            # azure returned error text
+            send_message(chat_id, f"⚠️ Analysis failed: {azure_text}", reply_to_message_id=message_id)
+            return
+
+        # Send result back to user
+        send_message(chat_id, "✅ Analysis complete:\n\n" + azure_text, reply_to_message_id=message_id)
 
     except Exception as e:
-        print("Image save error:", e)
-        await update.message.reply_text("❌ Could not save image. Try again.")
+        send_message(chat_id, f"⚠️ Error while processing screenshot: {str(e)}")
+        raise
 
+@app.route("/", methods=["GET"])
+def index():
+    return "Gold Analyzer Bot (Azure Vision) — alive"
 
-async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    row = get_user(chat_id)
-    if not row:
-        await update.message.reply_text("You are not registered. Send /start first.")
-        return
-    is_active = row[2]
-    last_image = row[5]
-    if not is_active:
-        admin_link = f"@{ADMIN_USERNAME}" if ADMIN_USERNAME else "admin"
-        msg = (
-            f"Your access is inactive. Contact admin {admin_link} to activate.\n\n"
-            "Steps:\n"
-            "1) Send /myid to the bot and copy your chat id.\n"
-            "2) Message the admin and share your chat id + payment details.\n"
-            "3) Admin will activate you using /activate <chat_id> <days>.\n"
-        )
-        await update.message.reply_text(msg)
-        return
-    if not last_image:
-        await update.message.reply_text("No screenshot found. Upload one first.")
-        return
-
-    await update.message.reply_text(f"📊 Analysis placeholder for image: {last_image}\n(Integration with OpenAI Vision coming next.)")
-
-
-# ---------------- Admin commands ----------------
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
-
-
-async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    caller = update.effective_user.id
-    if not is_admin(caller):
-        await update.message.reply_text("You are not authorized to use this command.")
-        return
-    args = context.args
-    if len(args) < 1:
-        await update.message.reply_text("Usage: /activate <chat_id> [days]. Example: /activate 123456789 30")
-        return
+# webhook endpoint path uses the token to avoid random posts
+@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
+def telegram_webhook():
     try:
-        target = int(args[0])
-        days = int(args[1]) if len(args) >= 2 else 30
-        expires = activate_user(target, days)
-        await update.message.reply_text(f"Activated {target} until {expires.date().isoformat()}")
-        try:
-            await context.bot.send_message(chat_id=target, text=f"✅ Your account has been activated until {expires.date().isoformat()}. You can now use /analyze.")
-        except Exception as e:
-            await update.message.reply_text(f"Note: could not send message to user {target}. They might not have started the bot. ({e})")
-    except Exception as ex:
-        await update.message.reply_text(f"Error: {ex}")
-
-
-async def cmd_deactivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    caller = update.effective_user.id
-    if not is_admin(caller):
-        await update.message.reply_text("You are not authorized to use this command.")
-        return
-    args = context.args
-    if len(args) < 1:
-        await update.message.reply_text("Usage: /deactivate <chat_id>")
-        return
-    try:
-        target = int(args[0])
-        deactivate_user(target)
-        await update.message.reply_text(f"Deactivated {target}")
-        try:
-            await context.bot.send_message(chat_id=target, text="⚠️ Your account has been deactivated by admin.")
-        except:
-            pass
-    except Exception as ex:
-        await update.message.reply_text(f"Error: {ex}")
-
-
-async def cmd_list_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    caller = update.effective_user.id
-    if not is_admin(caller):
-        await update.message.reply_text("You are not authorized to use this command.")
-        return
-    rows = get_active_users()
-    if not rows:
-        await update.message.reply_text("No active users currently.")
-        return
-    lines = ["Active users:"]
-    for chat_id, username, expires_at in rows:
-        expires = expires_at.split("T")[0] if expires_at else "N/A"
-        lines.append(f"- {username or 'unknown'} ({chat_id}) — expires {expires}")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await cmd_list_active(update, context)
-
-
-# ---------------- Main startup (webhook mode only) ----------------
-def main():
-    init_db()
-
-    if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN not set in environment")
-        return
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # register handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("myid", myid))
-    app.add_handler(MessageHandler(filters.PHOTO, echo_image))
-    app.add_handler(CommandHandler("analyze", analyze))
-    app.add_handler(CommandHandler("activate", cmd_activate))
-    app.add_handler(CommandHandler("deactivate", cmd_deactivate))
-    app.add_handler(CommandHandler("list_active", cmd_list_active))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-
-    # webhook URL: must be your render external URL + /<BOT_TOKEN>
-    service_url = RENDER_EXTERNAL_URL or os.getenv("SERVICE_URL") or ""
-    if not service_url:
-        print("WARNING: RENDER_EXTERNAL_URL not set. Set it to your Render app URL (https://your-app.onrender.com)")
-    webhook_url = f"{service_url.rstrip('/')}/{BOT_TOKEN}" if service_url else f"/{BOT_TOKEN}"
-    print("🤖 Bot starting in WEBHOOK mode. Webhook URL:", webhook_url)
-
-    try:
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=int(os.getenv("PORT", "8000")),
-            url_path=BOT_TOKEN,
-            webhook_url=webhook_url,
-        )
+        data = request.get_json(force=True)
     except Exception as e:
-        print("Webhook start failed:", e)
+        return jsonify({"ok": False, "error": "invalid json"}), 400
 
+    # Basic update handling
+    # Only handle messages with photos for now and text commands /start /analyze
+    if "message" in data:
+        msg = data["message"]
+        chat_id = msg["chat"]["id"]
+        message_id = msg.get("message_id")
+
+        # /start command
+        if "text" in msg:
+            text = msg["text"].strip()
+            if text.startswith("/start"):
+                user_name = msg["from"].get("first_name", "") or msg["from"].get("username","")
+                send_message(chat_id, f"Welcome {user_name}! Upload your chart screenshot and then send /analyze to process (if active).")
+                return jsonify({"ok": True})
+
+            if text.startswith("/analyze"):
+                send_message(chat_id, "If you already uploaded a screenshot in this chat, please reply to that message with /analyze or upload a screenshot now.")
+                return jsonify({"ok": True})
+
+            # other text -> small help
+            send_message(chat_id, "Send a chart image (photo). I'll save it and analyze automatically.")
+            return jsonify({"ok": True})
+
+        # If photo present
+        if "photo" in msg:
+            photos = msg["photo"]
+            # pick the largest (last one)
+            file_id = photos[-1]["file_id"]
+            try:
+                file_path = get_file_path(file_id)
+                img_bytes = download_telegram_file(file_path)
+            except Exception as e:
+                send_message(chat_id, f"⚠️ Could not download image: {str(e)}", reply_to_message_id=message_id)
+                return jsonify({"ok": False})
+
+            # Save locally (optional) - unique filename
+            ts = int(time.time())
+            filename = f"images/{chat_id}_{ts}.jpg"
+            os.makedirs("images", exist_ok=True)
+            with open(filename, "wb") as f:
+                f.write(img_bytes)
+
+            # acknowledge quickly
+            send_message(chat_id, "📸 Screenshot saved! Processing will continue in background — you will receive results here shortly.", reply_to_message_id=message_id)
+
+            # process in background
+            t = threading.Thread(target=process_screenshot_async, args=(chat_id, message_id, img_bytes), daemon=True)
+            t.start()
+            return jsonify({"ok": True})
+
+    # For other update types or no-ops
+    return jsonify({"ok": True})
 
 if __name__ == "__main__":
-    main()
+    # If running locally for debug: run on port 5000
+    port = int(os.environ.get("PORT", 5000))
+    print("Starting Flask server on port", port)
+    print("Webhook path: /" + TELEGRAM_TOKEN)
+    app.run(host="0.0.0.0", port=port)
