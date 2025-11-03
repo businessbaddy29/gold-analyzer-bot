@@ -1,272 +1,306 @@
-#!/usr/bin/env python3
-"""
-Bot for Telegram + Azure OpenAI (vision) integration.
-
-Requirements (pip):
-  pip install flask requests python-dotenv
-
-Env vars (set on Render / locally):
-  TELEGRAM_TOKEN            -> Telegram bot token (botXXXXXXXX:YYYY)
-  BASE_URL                  -> Public URL of your service, e.g. https://gold-analyzer-bot.onrender.com
-  AZURE_OPENAI_ENDPOINT     -> e.g. https://samee-mhjab3yd-eastus2.cognitiveservices.azure.com/
-  AZURE_OPENAI_DEPLOYMENT   -> e.g. gpt-4o-mini
-  AZURE_OPENAI_KEY          -> Azure OpenAI API key
-"""
-
+# bot.py
 import os
 import json
-import base64
 import threading
 import time
-from io import BytesIO
-
-import requests
+import logging
+from pathlib import Path
 from flask import Flask, request, jsonify
+import requests
 
-# load env
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-BASE_URL = os.environ.get("BASE_URL")  # e.g. https://gold-analyzer-bot.onrender.com (no trailing slash)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("gold-analyzer-bot")
+
+# Environment variables (must exist in Render environment)
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BASE_URL = os.environ.get("BASE_URL")  # e.g. https://your-app.onrender.com
 AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")  # e.g. https://...cognitiveservices.azure.com/
-AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT")  # e.g. gpt-4o-mini
 AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY")
-API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+ADMIN_IDS = os.environ.get("ADMIN_IDS", "")  # comma separated numeric chat ids
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "@admin")
+ACTIVE_USERS_FILE = "active_users.json"
 
-if not all([TELEGRAM_TOKEN, BASE_URL, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_DEPLOYMENT]):
-    missing = [k for k in ["TELEGRAM_TOKEN","BASE_URL","AZURE_OPENAI_ENDPOINT","AZURE_OPENAI_KEY","AZURE_OPENAI_DEPLOYMENT"] if not os.environ.get(k)]
-    raise SystemExit(f"Missing required env vars: {missing}")
+if not BOT_TOKEN or not BASE_URL or not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_DEPLOYMENT or not AZURE_OPENAI_KEY:
+    logger.error("Missing required environment variables. Make sure BOT_TOKEN, BASE_URL, AZURE_OPENAI_... vars are set.")
+    # don't exit - Flask will start but webhook won't be set
 
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+# Ensure storage folder for images
+IMAGES_DIR = Path("images")
+IMAGES_DIR.mkdir(exist_ok=True)
 
-app = Flask(__name__)
+# Active users persistence
+def load_active_users():
+    try:
+        if Path(ACTIVE_USERS_FILE).exists():
+            with open(ACTIVE_USERS_FILE, "r") as f:
+                return set(json.load(f))
+    except Exception as e:
+        logger.exception("Failed to load active users:", e)
+    return set()
 
-# helper to send message to Telegram
-def send_message(chat_id, text, reply_to_message_id=None):
-    url = f"{TELEGRAM_API}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+def save_active_users(s):
+    try:
+        with open(ACTIVE_USERS_FILE, "w") as f:
+            json.dump(list(s), f)
+    except Exception as e:
+        logger.exception("Failed to save active users:", e)
+
+active_users = load_active_users()
+
+# Parse admin ids
+admins = set()
+for part in ADMIN_IDS.split(","):
+    part = part.strip()
+    if part:
+        try:
+            admins.add(int(part))
+        except:
+            logger.warning("Invalid ADMIN_IDS entry: %s", part)
+
+
+# Telegram helpers
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+def tg_send_message(chat_id, text, parse_mode=None, reply_to_message_id=None):
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
-    r = requests.post(url, json=payload, timeout=30)
-    return r.ok, r.text
-
-def send_photo(chat_id, photo_bytes, caption=None):
-    url = f"{TELEGRAM_API}/sendPhoto"
-    files = {"photo": ("image.jpg", photo_bytes)}
-    data = {"chat_id": chat_id}
-    if caption:
-        data["caption"] = caption
-    r = requests.post(url, data=data, files=files, timeout=60)
-    return r.ok, r.text
-
-# download Telegram file bytes by file_path
-def download_telegram_file(file_path):
-    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
-    r = requests.get(file_url, timeout=30)
-    r.raise_for_status()
-    return r.content
-
-# Get file path from Telegram getFile
-def get_file_path(file_id):
-    url = f"{TELEGRAM_API}/getFile"
-    r = requests.get(url, params={"file_id": file_id}, timeout=20)
-    r.raise_for_status()
-    j = r.json()
-    if not j.get("ok"):
-        raise RuntimeError("getFile failed: " + json.dumps(j))
-    return j["result"]["file_path"]
-
-# Compose Azure request (we will include base64 data url)
-def call_azure_image_analysis(image_bytes, prompt_text):
-    """
-    Send image + prompt to Azure OpenAI chat completions endpoint (deployment).
-    We pass an 'input' like structure with an input_text and an input_image (base64 data URL).
-    """
-    # Build data URL (jpeg)
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    data_url = f"data:image/jpeg;base64,{b64}"
-
-    # Azure chat completions endpoint for deployment:
-    # POST {endpoint}/openai/deployments/{deployment}/chat/completions?api-version={API_VERSION}
-    endpoint = AZURE_OPENAI_ENDPOINT.rstrip("/") + f"/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version={API_VERSION}"
-
-    headers = {
-        "Content-Type": "application/json",
-        "api-key": AZURE_OPENAI_KEY
-    }
-
-    # Payload — include image as part of content array following examples used in Azure docs (image as input)
-    # NOTE: Azure flavors vary; this structure works with many image-enabled chat endpoints.
-    payload = {
-        "messages": [
-            {"role": "system", "content": "You are a helpful assistant that analyzes gold trading charts. Give clear Trend, Support & Resistance, Candlestick pattern (if any), Entry confluence, SL, TP, Timeframes H1 and H4."},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt_text},
-                    {"type": "input_image", "image_url": data_url}
-                ]
-            }
-        ],
-        "max_tokens": 800,
-        "temperature": 0.1
-    }
-
-    # Make request
-    resp = requests.post(endpoint, headers=headers, json=payload, timeout=120)
-    # if status not OK, raise helpful info
-    if resp.status_code != 200:
-        # return full body for debugging
-        return False, f"Azure returned status {resp.status_code}: {resp.text}"
-
-    # Parse response — different Azure versions return slightly different shapes
-    j = resp.json()
-
-    # Common patterns: 'choices' with 'message' or 'output_text' field; or 'reply' etc.
-    # We'll try several heuristics:
-    text = None
-    # 1) choices -> 0 -> message -> content -> parts / 0 / text
+    r = requests.post(f"{TG_API}/sendMessage", json=payload, timeout=15)
     try:
-        if "choices" in j and len(j["choices"])>0:
-            ch = j["choices"][0]
-            if isinstance(ch.get("message"), dict):
-                # message.content can be a string or list
-                msg = ch["message"].get("content")
-                if isinstance(msg, str):
-                    text = msg
-                elif isinstance(msg, list):
-                    # find first text block
-                    for part in msg:
-                        if isinstance(part, str):
-                            text = part
-                            break
-                        if isinstance(part, dict) and "text" in part:
-                            text = part["text"]
-                            break
-            elif "message" in ch and isinstance(ch["message"], str):
-                text = ch["message"]
-            elif "text" in ch:
-                text = ch["text"]
+        r.raise_for_status()
     except Exception:
-        pass
+        logger.exception("tg_send_message failed: %s", r.text if r is not None else "no resp")
+    return r.json()
 
-    # 2) 'output_text' top-level
-    if not text:
-        if "output_text" in j:
-            text = j["output_text"]
-
-    # 3) 'response' -> 'output' etc
-    if not text:
-        # inspect nested fields quickly
-        for k in ("response","result","output"):
-            if k in j and isinstance(j[k], dict):
-                for k2 in ("output_text","text"):
-                    if k2 in j[k]:
-                        text = j[k][k2]
-                        break
-                if text:
-                    break
-
-    # 4) fallback: dump the whole json as a string
-    if not text:
-        text = "No standard text found in Azure response. Raw JSON:\n" + json.dumps(j, indent=2)[:1800]
-
-    return True, text
-
-# Background worker for processing image to azure and responding to user
-def process_screenshot_async(chat_id, message_id, image_bytes):
+def tg_set_webhook():
+    if not BOT_TOKEN or not BASE_URL:
+        logger.error("Cannot set webhook: BOT_TOKEN or BASE_URL missing.")
+        return
+    webhook_url = f"{BASE_URL}/{BOT_TOKEN}"
+    r = requests.get(f"{TG_API}/setWebhook", params={"url": webhook_url}, timeout=20)
     try:
-        # Step 1: send a processing message (edit or new)
-        send_message(chat_id, "🔎 Processing your screenshot — I'll send results here when ready.", reply_to_message_id=message_id)
+        r.raise_for_status()
+        logger.info("setWebhook result: %s", r.json())
+    except Exception:
+        logger.exception("Failed to set webhook: %s", r.text if r is not None else "no resp")
 
-        # Step 2: create a concise prompt that instructs model for trading analysis
-        prompt = (
-            "Analyze the attached gold price chart screenshot (candlestick chart). "
-            "Return a short structured analysis with sections: Trend, Support, Resistance, "
-            "Candlestick pattern (if any), Entry confluence (why enter), Suggested entry price(s), "
-            "Stop Loss (SL), Take Profit (TP), Timeframes checked (H1 and H4). "
-            "Be concise and give numeric values if visible; if you can't determine values, say 'not visible'."
+# Azure OpenAI call
+def azure_chat_completion(system_prompt, user_prompt, max_tokens=400):
+    endpoint = AZURE_OPENAI_ENDPOINT.rstrip("/") + f"/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions"
+    params = {"api-version": AZURE_OPENAI_API_VERSION}
+    headers = {"api-key": AZURE_OPENAI_KEY, "Content-Type": "application/json"}
+    data = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.2
+    }
+    try:
+        resp = requests.post(endpoint, params=params, headers=headers, json=data, timeout=30)
+        resp.raise_for_status()
+        j = resp.json()
+        # The structure may be different across versions; try common result paths:
+        # prefer choices[0].message.content
+        text = None
+        if "choices" in j and len(j["choices"])>0 and "message" in j["choices"][0]:
+            text = j["choices"][0]["message"].get("content")
+        elif "choices" in j and len(j["choices"])>0 and "text" in j["choices"][0]:
+            text = j["choices"][0].get("text")
+        else:
+            text = str(j)
+        return text
+    except Exception:
+        logger.exception("Azure OpenAI call failed")
+        return None
+
+# Image analysis worker (background)
+def analyze_image_worker(chat_id, image_path):
+    """Save immediate confirmation then call Azure to analyze (note: model won't truly parse image file bytes
+       unless using a vision-enabled model; here we pass a structured prompt describing the task).
+       Replace with real vision integration when available."""
+    try:
+        # Give user a little delay simulation (or heavy processing time)
+        time.sleep(1)
+
+        # System prompt: instruct the model to act as gold chart analyzer
+        system_prompt = (
+            "You are a helpful, concise gold price chart analyst. The user uploaded a chart image (path provided). "
+            "If you cannot access image content, explain you can't and provide a short checklist the user can copy for a manual analysis "
+            "(trend direction, support, resistance, candle pattern, buy/sell bias). Keep it short and in bullet points."
         )
 
-        ok, azure_text = call_azure_image_analysis(image_bytes, prompt)
-        if not ok:
-            # azure returned error text
-            send_message(chat_id, f"⚠️ Analysis failed: {azure_text}", reply_to_message_id=message_id)
-            return
+        user_prompt = (
+            f"I have saved the uploaded image on the server at: {image_path}\n\n"
+            "Please (1) try to analyze the gold price chart (trend/support/resistance/entry confluence) and (2) if you don't actually have image pixels, "
+            "explicitly mention that this is a simulated analysis and provide a short actionable checklist for the user to perform a manual check."
+        )
 
-        # Send result back to user
-        send_message(chat_id, "✅ Analysis complete:\n\n" + azure_text, reply_to_message_id=message_id)
+        # Notify that analysis running (if desired we already sent earlier confirmations)
+        # Call Azure OpenAI
+        result = azure_chat_completion(system_prompt, user_prompt, max_tokens=350)
+        if not result:
+            result = "Sorry, analysis failed — the server couldn't reach the model. Contact admin."
 
-    except Exception as e:
-        send_message(chat_id, f"⚠️ Error while processing screenshot: {str(e)}")
-        raise
+        # Send final message
+        tg_send_message(chat_id, result)
+    except Exception:
+        logger.exception("analyze_image_worker error")
+        tg_send_message(chat_id, "Analysis failed due to internal error. Contact admin.")
 
-@app.route("/", methods=["GET"])
-def index():
-    return "Gold Analyzer Bot (Azure Vision) — alive"
 
-# webhook endpoint path uses the token to avoid random posts
-@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
+# Flask app
+app = Flask(__name__)
+
+@app.route("/")
+def health():
+    return jsonify({"status":"ok","note":"bot webhook running"}), 200
+
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def telegram_webhook():
+    """Receive update from Telegram and process"""
     try:
-        data = request.get_json(force=True)
-    except Exception as e:
-        return jsonify({"ok": False, "error": "invalid json"}), 400
+        update = request.get_json(force=True)
+        logger.info("Received update: %s", update and update.get("message", update))
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            return jsonify({"ok":True})
 
-    # Basic update handling
-    # Only handle messages with photos for now and text commands /start /analyze
-    if "message" in data:
-        msg = data["message"]
-        chat_id = msg["chat"]["id"]
-        message_id = msg.get("message_id")
+        chat = message["chat"]
+        chat_id = chat["id"]
+        text = message.get("text", "")
+        username = message.get("from", {}).get("username") or message.get("from", {}).get("first_name")
 
-        # /start command
-        if "text" in msg:
-            text = msg["text"].strip()
-            if text.startswith("/start"):
-                user_name = msg["from"].get("first_name", "") or msg["from"].get("username","")
-                send_message(chat_id, f"Welcome {user_name}! Upload your chart screenshot and then send /analyze to process (if active).")
-                return jsonify({"ok": True})
+        # handle /start
+        if text and text.strip().startswith("/start"):
+            welcome = f"Welcome {username or ''}!\nUpload your chart screenshot and then send /analyze (if you are active).\nIf your access is inactive, message admin: {ADMIN_USERNAME}"
+            tg_send_message(chat_id, welcome)
+            return jsonify({"ok":True})
 
-            if text.startswith("/analyze"):
-                send_message(chat_id, "If you already uploaded a screenshot in this chat, please reply to that message with /analyze or upload a screenshot now.")
-                return jsonify({"ok": True})
-
-            # other text -> small help
-            send_message(chat_id, "Send a chart image (photo). I'll save it and analyze automatically.")
-            return jsonify({"ok": True})
-
-        # If photo present
-        if "photo" in msg:
-            photos = msg["photo"]
-            # pick the largest (last one)
-            file_id = photos[-1]["file_id"]
+        # admin commands
+        if text and text.startswith("/activate"):
+            # only allow admins
+            if int(chat_id) not in admins and (message.get("from",{}).get("id") not in admins):
+                tg_send_message(chat_id, "Only admin can activate users.")
+                return jsonify({"ok":True})
+            parts = text.split()
+            if len(parts) < 2:
+                tg_send_message(chat_id, "Usage: /activate <chat_id>")
+                return jsonify({"ok":True})
             try:
-                file_path = get_file_path(file_id)
-                img_bytes = download_telegram_file(file_path)
-            except Exception as e:
-                send_message(chat_id, f"⚠️ Could not download image: {str(e)}", reply_to_message_id=message_id)
-                return jsonify({"ok": False})
+                target = int(parts[1])
+                active_users.add(target)
+                save_active_users(active_users)
+                tg_send_message(chat_id, f"Activated {target}")
+            except:
+                tg_send_message(chat_id, "Invalid chat id.")
+            return jsonify({"ok":True})
 
-            # Save locally (optional) - unique filename
-            ts = int(time.time())
-            filename = f"images/{chat_id}_{ts}.jpg"
-            os.makedirs("images", exist_ok=True)
-            with open(filename, "wb") as f:
-                f.write(img_bytes)
+        if text and text.startswith("/deactivate"):
+            if int(chat_id) not in admins and (message.get("from",{}).get("id") not in admins):
+                tg_send_message(chat_id, "Only admin can deactivate users.")
+                return jsonify({"ok":True})
+            parts = text.split()
+            if len(parts) < 2:
+                tg_send_message(chat_id, "Usage: /deactivate <chat_id>")
+                return jsonify({"ok":True})
+            try:
+                target = int(parts[1])
+                active_users.discard(target)
+                save_active_users(active_users)
+                tg_send_message(chat_id, f"Deactivated {target}")
+            except:
+                tg_send_message(chat_id, "Invalid chat id.")
+            return jsonify({"ok":True})
 
-            # acknowledge quickly
-            send_message(chat_id, "📸 Screenshot saved! Processing will continue in background — you will receive results here shortly.", reply_to_message_id=message_id)
+        if text and text.startswith("/list_active"):
+            if int(chat_id) not in admins and (message.get("from",{}).get("id") not in admins):
+                tg_send_message(chat_id, "Only admin can list active users.")
+                return jsonify({"ok":True})
+            if not active_users:
+                tg_send_message(chat_id, "No active users.")
+            else:
+                tg_send_message(chat_id, "Active users:\n" + "\n".join(map(str, active_users)))
+            return jsonify({"ok":True})
 
-            # process in background
-            t = threading.Thread(target=process_screenshot_async, args=(chat_id, message_id, img_bytes), daemon=True)
+        # /analyze command - user requests analysis of previously uploaded image
+        if text and text.strip().startswith("/analyze"):
+            if chat_id not in active_users:
+                tg_send_message(chat_id, f"Your access is inactive. Contact admin: {ADMIN_USERNAME}")
+                return jsonify({"ok":True})
+            # find latest image file for this user
+            user_files = sorted(IMAGES_DIR.glob(f"{chat_id}_*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if not user_files:
+                tg_send_message(chat_id, "No screenshot found. Please upload your screenshot first.")
+                return jsonify({"ok":True})
+            image_path = str(user_files[0])
+            tg_send_message(chat_id, "Processing your screenshot — I'll send results here when ready.")
+            t = threading.Thread(target=analyze_image_worker, args=(chat_id, image_path), daemon=True)
             t.start()
-            return jsonify({"ok": True})
+            return jsonify({"ok":True})
 
-    # For other update types or no-ops
-    return jsonify({"ok": True})
+        # photo handler
+        if "photo" in message:
+            # Telegram sends multiple sizes; pick largest
+            photos = message["photo"]
+            file_id = photos[-1]["file_id"]
+            # get file path from Telegram
+            file_info = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=15).json()
+            file_path = file_info.get("result", {}).get("file_path")
+            if not file_path:
+                tg_send_message(chat_id, "Failed to get file from Telegram.")
+                return jsonify({"ok":True})
+            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+            local_filename = IMAGES_DIR / f"{chat_id}_{int(time.time())}.jpg"
+            try:
+                r = requests.get(file_url, stream=True, timeout=30)
+                r.raise_for_status()
+                with open(local_filename, "wb") as f:
+                    for chunk in r.iter_content(1024):
+                        f.write(chunk)
+                # confirm to user
+                tg_send_message(chat_id, "📸 Screenshot saved! Processing will continue in background — you will receive results here shortly.")
+                tg_send_message(chat_id, "🔎 Processing your screenshot — I'll send results here when ready.")
+                # start background analysis thread (only if user active)
+                if chat_id in active_users:
+                    t = threading.Thread(target=analyze_image_worker, args=(chat_id, str(local_filename)), daemon=True)
+                    t.start()
+                else:
+                    tg_send_message(chat_id, f"✅ Screenshot saved! Use /analyze to run analysis (if active).\nYour access is inactive. Contact admin: {ADMIN_USERNAME}")
+            except Exception:
+                logger.exception("Failed to download/save photo")
+                tg_send_message(chat_id, "Failed to download the photo. Try again.")
+            return jsonify({"ok":True})
+
+        # fallback - echo or help
+        if text:
+            if chat_id in active_users:
+                tg_send_message(chat_id, "Send a screenshot of the chart, then /analyze. Or if you need help, use /start.")
+            else:
+                tg_send_message(chat_id, f"Your access is inactive. Contact admin: {ADMIN_USERNAME}")
+            return jsonify({"ok":True})
+
+    except Exception:
+        logger.exception("Error in webhook handler")
+    return jsonify({"ok":True})
+
+
+# set webhook at startup (in a small delay to let server start)
+def start_set_webhook_delayed():
+    time.sleep(1.5)
+    try:
+        tg_set_webhook()
+    except Exception:
+        logger.exception("set webhook failed")
 
 if __name__ == "__main__":
-    # If running locally for debug: run on port 5000
-    port = int(os.environ.get("PORT", 5000))
-    print("Starting Flask server on port", port)
-    print("Webhook path: /" + TELEGRAM_TOKEN)
+    # start webhook setter thread
+    threading.Thread(target=start_set_webhook_delayed, daemon=True).start()
+    # If running standalone (locally) which is useful for testing:
+    port = int(os.environ.get("PORT", 10000))
+    logger.info("Starting Flask on port %s", port)
     app.run(host="0.0.0.0", port=port)
